@@ -185,6 +185,8 @@ Contributions welcome. The two plugins are deliberately simple — single-file P
 3. Add a Changelog entry in the plugin's README
 4. Bump version numbers in both the plugin header and the `*_VERSION` constant
 
+**Maintainer workflow:** This project's canonical source lives in a private monorepo and is mirrored here via `git subtree`. See [DEVELOPMENT.md](./DEVELOPMENT.md) for the full sync workflow, release process, and directory layout.
+
 ---
 
 ## Changelog
