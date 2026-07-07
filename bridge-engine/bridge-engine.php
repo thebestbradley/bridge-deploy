@@ -2,14 +2,14 @@
 /**
  * Plugin Name: Bridge Engine
  * Description: Local command center for managing staging site connections. Push/pull files, themes, mu-plugins, and DB content to staging sites via the Deploy Bridge API.
- * Version: 1.1.0
+ * Version: 2.1.0
  * Author: HypedUp Studios
  * Text Domain: bridge-engine
  */
 
 defined('ABSPATH') || exit;
 
-define('DBC_VERSION', '1.1.0');
+define('DBC_VERSION', '2.1.0');
 
 /**
  * Default path to the parent directory containing your local WordPress sites.
@@ -69,12 +69,17 @@ class DeployBridgeCommander {
         // AJAX handlers
         add_action('wp_ajax_dbc_test_connection', [$this, 'ajax_test_connection']);
         add_action('wp_ajax_dbc_save_site', [$this, 'ajax_save_site']);
+        add_action('wp_ajax_dbc_save_sites_json', [$this, 'ajax_save_sites_json']);
         add_action('wp_ajax_dbc_delete_site', [$this, 'ajax_delete_site']);
         add_action('wp_ajax_dbc_push', [$this, 'ajax_push']);
         add_action('wp_ajax_dbc_pull', [$this, 'ajax_pull']);
         add_action('wp_ajax_dbc_quick_action', [$this, 'ajax_quick_action']);
         add_action('wp_ajax_dbc_clear_log', [$this, 'ajax_clear_log']);
         add_action('wp_ajax_dbc_save_settings', [$this, 'ajax_save_settings']);
+
+        // Full content sync (bidirectional)
+        add_action('wp_ajax_dbc_full_sync',         [$this, 'ajax_full_sync']);
+        add_action('wp_ajax_dbc_full_sync_uploads', [$this, 'ajax_full_sync_uploads']);
     }
 
     // =====================================================================
@@ -93,14 +98,21 @@ class DeployBridgeCommander {
 
     public function enqueue_assets($hook) {
         if ($hook !== 'tools_page_bridge-engine') return;
-        wp_enqueue_style('dbc-style', false);
+
+        // Style — register first, then enqueue + add inline CSS.
+        wp_register_style('dbc-style', false, [], DBC_VERSION);
+        wp_enqueue_style('dbc-style');
         wp_add_inline_style('dbc-style', $this->get_inline_css());
-        wp_enqueue_script('dbc-script', false);
-        wp_add_inline_script('dbc-script', $this->get_inline_js());
+
+        // Script — must be registered (with jQuery dep) BEFORE enqueue/inline/localize,
+        // otherwise WP silently drops the handle and no <script> tag is printed.
+        wp_register_script('dbc-script', '', ['jquery'], DBC_VERSION, true);
+        wp_enqueue_script('dbc-script');
         wp_localize_script('dbc-script', 'dbc', [
             'ajax_url' => admin_url('admin-ajax.php'),
             'nonce'    => wp_create_nonce('dbc_nonce'),
         ]);
+        wp_add_inline_script('dbc-script', $this->get_inline_js());
     }
 
     // =====================================================================
@@ -171,7 +183,7 @@ class DeployBridgeCommander {
     // API CLIENT
     // =====================================================================
 
-    private function api_request($site_config, $method, $endpoint, $body = null, $is_file = false) {
+    private function api_request($site_config, $method, $endpoint, $body = null, $is_file = false, $timeout = 60) {
         $url = rtrim($site_config['url'], '/') . '/wp-json/deploy-bridge/v1/' . $endpoint;
 
         $headers = [
@@ -181,7 +193,7 @@ class DeployBridgeCommander {
         $args = [
             'method'  => $method,
             'headers' => $headers,
-            'timeout' => 60,
+            'timeout' => $timeout,
             'sslverify' => false, // local/staging certs
         ];
 
@@ -304,19 +316,67 @@ class DeployBridgeCommander {
         if (empty($alias)) wp_send_json_error('Alias is required');
 
         $sites = $this->get_sites();
+        $existed = isset($sites[$alias]);
+        $prev = $sites[$alias] ?? [];
         $sites[$alias] = [
             'url'        => esc_url_raw($_POST['url'] ?? ''),
             'key'        => sanitize_text_field($_POST['key'] ?? ''),
             'secret'     => sanitize_text_field($_POST['secret'] ?? ''),
             'local_site' => sanitize_text_field($_POST['local_site'] ?? ''),
             'theme'      => sanitize_text_field($_POST['theme'] ?? ''),
-            'status'     => 'unknown',
-            'last_check' => null,
+            // Preserve the last known connection state when editing an existing
+            // connection; Test re-validates. New connections start unknown.
+            'status'     => $prev['status'] ?? 'unknown',
+            'last_check' => $prev['last_check'] ?? null,
         ];
         $this->save_sites($sites);
 
-        $this->add_log('config', $alias, 'Site configuration saved');
+        $this->add_log('config', $alias, $existed ? 'Site configuration updated' : 'Site configuration saved');
         wp_send_json_success('Site saved');
+    }
+
+    /**
+     * Bulk-edit every connection at once by replacing the dbc_sites option
+     * with a hand-edited JSON document (the "JSON" tab). Each entry is
+     * sanitized field-by-field; status/last_check are carried over from the
+     * matching existing connection when the JSON omits them.
+     */
+    public function ajax_save_sites_json() {
+        check_ajax_referer('dbc_nonce', 'nonce');
+        if (!current_user_can('manage_options')) wp_die('Forbidden');
+
+        $raw = isset($_POST['json']) ? wp_unslash($_POST['json']) : '';
+        $decoded = json_decode($raw, true);
+        if (!is_array($decoded)) {
+            wp_send_json_error('Invalid JSON: ' . (json_last_error_msg() ?: 'expected an object of connections keyed by alias'));
+        }
+
+        $existing = $this->get_sites();
+        $clean = [];
+        foreach ($decoded as $alias => $cfg) {
+            $alias = sanitize_key($alias);
+            if ($alias === '' || !is_array($cfg)) continue;
+            $prev = $existing[$alias] ?? [];
+            $clean[$alias] = [
+                'url'        => esc_url_raw($cfg['url'] ?? ($prev['url'] ?? '')),
+                'key'        => sanitize_text_field($cfg['key'] ?? ($prev['key'] ?? '')),
+                'secret'     => sanitize_text_field($cfg['secret'] ?? ($prev['secret'] ?? '')),
+                'local_site' => sanitize_text_field($cfg['local_site'] ?? ($prev['local_site'] ?? '')),
+                'theme'      => sanitize_text_field($cfg['theme'] ?? ($prev['theme'] ?? '')),
+                'status'     => sanitize_text_field($cfg['status'] ?? ($prev['status'] ?? 'unknown')),
+                'last_check' => array_key_exists('last_check', $cfg)
+                    ? ($cfg['last_check'] !== null ? sanitize_text_field((string) $cfg['last_check']) : null)
+                    : ($prev['last_check'] ?? null),
+            ];
+        }
+
+        if (empty($clean)) {
+            wp_send_json_error('No valid connections found. Each entry must be an object keyed by alias with at least a url.');
+        }
+
+        $this->save_sites($clean);
+        $this->add_log('config', '(bulk)', 'Connections bulk-edited via JSON (' . count($clean) . ' ' . (count($clean) === 1 ? 'site' : 'sites') . ')');
+        wp_send_json_success(['count' => count($clean)]);
     }
 
     public function ajax_delete_site() {
@@ -359,6 +419,9 @@ class DeployBridgeCommander {
             switch ($item) {
                 case 'mu-plugins':
                     $paths[] = 'mu-plugins';
+                    break;
+                case 'plugins':
+                    $paths[] = 'plugins';
                     break;
                 case 'theme':
                     $theme = $config['theme'] ?: '';
@@ -451,6 +514,7 @@ class DeployBridgeCommander {
         $dir = '';
         switch ($what) {
             case 'mu-plugins': $dir = 'mu-plugins'; break;
+            case 'plugins':   $dir = 'plugins'; break;
             case 'theme':
                 $dir = 'themes/' . ($config['theme'] ?: '');
                 break;
@@ -588,6 +652,221 @@ class DeployBridgeCommander {
     }
 
     // =====================================================================
+    // FULL CONTENT SYNC (bidirectional, between any two configured sites)
+    // =====================================================================
+
+    /**
+     * Pulls /sync-export from source, posts /sync-import to target.
+     * Both sides must have deploy-bridge mu-plugin v2.0.0+ installed.
+     */
+    public function ajax_full_sync() {
+        check_ajax_referer('dbc_nonce', 'nonce');
+        if (!current_user_can('manage_options')) wp_die('Forbidden');
+
+        $source_alias = sanitize_key($_POST['source'] ?? '');
+        $target_alias = sanitize_key($_POST['target'] ?? '');
+        $dry_run      = !empty($_POST['dry_run']);
+
+        $sites = $this->get_sites();
+        if (empty($sites[$source_alias])) wp_send_json_error('Source site not found');
+        if (empty($sites[$target_alias])) wp_send_json_error('Target site not found');
+        if ($source_alias === $target_alias) wp_send_json_error('Source and target must differ');
+
+        $source = $sites[$source_alias];
+        $target = $sites[$target_alias];
+
+        // Post-type selection — defaults to all whitelisted types if none supplied.
+        $post_types_in = isset($_POST['post_types']) && is_array($_POST['post_types'])
+            ? array_map('sanitize_key', $_POST['post_types'])
+            : ['post', 'page', 'attachment', 'nav_menu_item', 'lc_partial', 'wp_block', 'custom_css'];
+
+        $t0 = microtime(true);
+
+        // 1. Pull content payload from source
+        $export = $this->api_request(
+            $source,
+            'POST',
+            'sync-export',
+            ['post_types' => $post_types_in],
+            false,
+            300
+        );
+
+        if (isset($export['error'])) {
+            $this->add_log('sync', $source_alias, "Export failed: " . $export['error'], 0, 'error');
+            wp_send_json_error('Source export failed: ' . $export['error']);
+        }
+        if (empty($export['posts']) && empty($export['options'])) {
+            wp_send_json_error('Source returned an empty payload — is sync-export endpoint up to date? (deploy-bridge v2.0.0 required)');
+        }
+
+        // 2. Build import payload — same shape, plus URL replacement + dry_run flag
+        $payload = [
+            'post_types'         => $export['post_types'] ?? $post_types_in,
+            'posts'              => $export['posts'] ?? [],
+            'postmeta'           => $export['postmeta'] ?? [],
+            'terms'              => $export['terms'] ?? [],
+            'term_taxonomy'      => $export['term_taxonomy'] ?? [],
+            'term_relationships' => $export['term_relationships'] ?? [],
+            'termmeta'           => $export['termmeta'] ?? [],
+            'options'            => $export['options'] ?? [],
+            'replace_url_from'   => rtrim($source['url'], '/'),
+            'replace_url_to'     => rtrim($target['url'], '/'),
+            'dry_run'            => $dry_run,
+        ];
+
+        // 3. Push to target
+        $import = $this->api_request($target, 'POST', 'sync-import', $payload, false, 300);
+
+        if (isset($import['error'])) {
+            $this->add_log('sync', $target_alias, "Import failed: " . $import['error'], 0, 'error');
+            wp_send_json_error('Target import failed: ' . $import['error']);
+        }
+
+        $stats = $import['stats'] ?? [];
+        $elapsed = round(microtime(true) - $t0, 1);
+
+        $verb = $dry_run ? 'Dry-run' : 'Synced';
+        $summary = sprintf(
+            '%s %s → %s (posts: %d, options: %d, terms: %d) in %ss',
+            $verb,
+            $source_alias,
+            $target_alias,
+            (int)($stats['posts_inserted'] ?? 0),
+            (int)($stats['options_updated'] ?? 0),
+            (int)($stats['terms_replaced'] ?? 0),
+            $elapsed
+        );
+
+        $this->add_log('sync', "{$source_alias} → {$target_alias}", $summary,
+            (int)($stats['posts_inserted'] ?? 0), 'success');
+
+        wp_send_json_success([
+            'source'      => $source_alias,
+            'target'      => $target_alias,
+            'dry_run'     => $dry_run,
+            'stats'       => $stats,
+            'elapsed_sec' => $elapsed,
+            'summary'     => $summary,
+        ]);
+    }
+
+    /**
+     * Diffs uploads/ between source and target by sha1, then pulls the missing/changed
+     * files from source and pushes them to target. Runs in batches to avoid PHP timeouts.
+     */
+    public function ajax_full_sync_uploads() {
+        check_ajax_referer('dbc_nonce', 'nonce');
+        if (!current_user_can('manage_options')) wp_die('Forbidden');
+
+        $source_alias = sanitize_key($_POST['source'] ?? '');
+        $target_alias = sanitize_key($_POST['target'] ?? '');
+        $batch_size   = max(1, min(200, intval($_POST['batch_size'] ?? 50)));
+
+        $sites = $this->get_sites();
+        if (empty($sites[$source_alias])) wp_send_json_error('Source site not found');
+        if (empty($sites[$target_alias])) wp_send_json_error('Target site not found');
+
+        $source = $sites[$source_alias];
+        $target = $sites[$target_alias];
+
+        $t0 = microtime(true);
+
+        // 1. Get manifests from both sides
+        $src_manifest = $this->api_request($source, 'GET', 'uploads-manifest', null, false, 120);
+        if (isset($src_manifest['error'])) {
+            wp_send_json_error('Source manifest failed: ' . $src_manifest['error']);
+        }
+        $tgt_manifest = $this->api_request($target, 'GET', 'uploads-manifest', null, false, 120);
+        if (isset($tgt_manifest['error'])) {
+            wp_send_json_error('Target manifest failed: ' . $tgt_manifest['error']);
+        }
+
+        // 2. Build diff: files in source that target doesn't have OR has with different sha1
+        $tgt_index = [];
+        foreach (($tgt_manifest['files'] ?? []) as $f) {
+            $tgt_index[$f['path']] = $f['sha1'];
+        }
+
+        $to_transfer = [];
+        foreach (($src_manifest['files'] ?? []) as $f) {
+            if (!isset($tgt_index[$f['path']]) || $tgt_index[$f['path']] !== $f['sha1']) {
+                $to_transfer[] = 'uploads/' . $f['path'];
+            }
+        }
+
+        if (empty($to_transfer)) {
+            $elapsed = round(microtime(true) - $t0, 1);
+            $this->add_log('sync', "{$source_alias} → {$target_alias}", "Uploads already in sync ({$elapsed}s)", 0, 'success');
+            wp_send_json_success([
+                'transferred' => 0,
+                'source_count' => count($src_manifest['files'] ?? []),
+                'target_count' => count($tgt_manifest['files'] ?? []),
+                'elapsed_sec'  => $elapsed,
+                'summary'      => 'Uploads already in sync.',
+            ]);
+        }
+
+        // 3. Transfer in batches: pull from source as zip → push to target
+        $transferred = 0;
+        $errors = [];
+        foreach (array_chunk($to_transfer, $batch_size) as $batch) {
+            $pull = $this->api_request($source, 'POST', 'pull', [
+                'type'  => 'files',
+                'paths' => $batch,
+            ], false, 300);
+
+            if (isset($pull['error'])) {
+                $errors[] = 'Pull batch failed: ' . $pull['error'];
+                break;
+            }
+            if (empty($pull['zip'])) {
+                $errors[] = 'Pull batch returned no zip';
+                break;
+            }
+
+            $tmpzip = wp_tempnam('dbc-uploads-sync-') . '.zip';
+            if (false === file_put_contents($tmpzip, $pull['zip'])) {
+                $errors[] = 'Failed to write temp zip';
+                break;
+            }
+
+            $push = $this->api_request($target, 'POST', 'push', $tmpzip, true, 300);
+            @unlink($tmpzip);
+
+            if (isset($push['error'])) {
+                $errors[] = 'Push batch failed: ' . $push['error'];
+                break;
+            }
+            $transferred += (int)($push['files'] ?? count($batch));
+        }
+
+        $elapsed = round(microtime(true) - $t0, 1);
+        if (!empty($errors)) {
+            $this->add_log('sync', "{$source_alias} → {$target_alias}",
+                "Uploads partial: {$transferred} transferred, errors: " . implode('; ', $errors),
+                $transferred, 'error');
+            wp_send_json_error([
+                'message'     => implode('; ', $errors),
+                'transferred' => $transferred,
+                'elapsed_sec' => $elapsed,
+            ]);
+        }
+
+        $this->add_log('sync', "{$source_alias} → {$target_alias}",
+            "Uploads synced: {$transferred} files in {$elapsed}s",
+            $transferred, 'success');
+
+        wp_send_json_success([
+            'transferred'  => $transferred,
+            'source_count' => count($src_manifest['files'] ?? []),
+            'target_count' => count($tgt_manifest['files'] ?? []),
+            'elapsed_sec'  => $elapsed,
+            'summary'      => "Transferred {$transferred} file(s) in {$elapsed}s.",
+        ]);
+    }
+
+    // =====================================================================
     // PAGE RENDERER
     // =====================================================================
 
@@ -601,18 +880,22 @@ class DeployBridgeCommander {
 
             <nav class="nav-tab-wrapper">
                 <a href="?page=bridge-engine&tab=sites" class="nav-tab <?php echo $tab === 'sites' ? 'nav-tab-active' : ''; ?>">Sites</a>
+                <a href="?page=bridge-engine&tab=fullsync" class="nav-tab <?php echo $tab === 'fullsync' ? 'nav-tab-active' : ''; ?>">Full Sync</a>
                 <a href="?page=bridge-engine&tab=sync" class="nav-tab <?php echo $tab === 'sync' ? 'nav-tab-active' : ''; ?>">Push / Pull</a>
                 <a href="?page=bridge-engine&tab=log" class="nav-tab <?php echo $tab === 'log' ? 'nav-tab-active' : ''; ?>">Log</a>
-                <a href="?page=bridge-engine&tab=settings" class="nav-tab <?php echo $tab === 'settings' ? 'nav-tab-active' : ''; ?>">⚙️ Settings</a>
+                <a href="?page=bridge-engine&tab=settings" class="nav-tab <?php echo $tab === 'settings' ? 'nav-tab-active' : ''; ?>">Settings</a>
+                <a href="?page=bridge-engine&tab=json" class="nav-tab <?php echo $tab === 'json' ? 'nav-tab-active' : ''; ?>">JSON</a>
             </nav>
 
             <div class="dbc-tab-content" style="margin-top:20px;">
                 <?php
                 switch ($tab) {
                     case 'sites':    $this->render_sites_tab($sites, $local_folders); break;
+                    case 'fullsync': $this->render_fullsync_tab($sites); break;
                     case 'sync':     $this->render_sync_tab($sites, $local_folders); break;
                     case 'log':      $this->render_log_tab(); break;
                     case 'settings': $this->render_settings_tab(); break;
+                    case 'json':     $this->render_json_tab($sites); break;
                 }
                 ?>
             </div>
@@ -651,6 +934,13 @@ class DeployBridgeCommander {
                     <td><?php echo esc_html($s['last_check'] ?? 'Never'); ?></td>
                     <td>
                         <button class="button button-small dbc-test-btn" data-alias="<?php echo esc_attr($alias); ?>">Test</button>
+                        <button class="button button-small dbc-edit-btn"
+                                data-alias="<?php echo esc_attr($alias); ?>"
+                                data-url="<?php echo esc_attr($s['url'] ?? ''); ?>"
+                                data-key="<?php echo esc_attr($s['key'] ?? ''); ?>"
+                                data-secret="<?php echo esc_attr($s['secret'] ?? ''); ?>"
+                                data-local="<?php echo esc_attr($s['local_site'] ?? ''); ?>"
+                                data-theme="<?php echo esc_attr($s['theme'] ?? ''); ?>">Edit</button>
                         <button class="button button-small dbc-delete-btn" data-alias="<?php echo esc_attr($alias); ?>" style="color:#c00;">Delete</button>
                     </td>
                 </tr>
@@ -660,7 +950,7 @@ class DeployBridgeCommander {
         <?php endif; ?>
 
         <hr>
-        <h3>Add / Edit Site</h3>
+        <h3 id="dbc-form-heading">Add / Edit Site <span id="dbc-edit-mode" style="font-size:13px;font-weight:400;"></span></h3>
         <table class="form-table" id="dbc-add-site-form">
             <tr><th>Alias</th><td><input type="text" id="dbc-alias" class="regular-text" placeholder="probate-v2"></td></tr>
             <tr><th>Staging URL</th><td><input type="url" id="dbc-url" class="regular-text" placeholder="https://probate-2026-v2.inetdemo1.com/staging"></td></tr>
@@ -680,6 +970,76 @@ class DeployBridgeCommander {
             <tr><th>Theme Slug</th><td><input type="text" id="dbc-theme" class="regular-text" placeholder="picostrap5-probate-child"></td></tr>
         </table>
         <p><button class="button button-primary" id="dbc-save-site-btn">Save Site</button> <span id="dbc-save-result"></span></p>
+        <?php
+    }
+
+    // --- FULL SYNC TAB (content + appearance, bidirectional) ---
+    private function render_fullsync_tab($sites) {
+        if (count($sites) < 2) {
+            echo '<div class="notice notice-warning"><p>You need at least <strong>two</strong> sites configured (a source and a target) to run a full sync. Add them in the Sites tab. Both sites must have <code>deploy-bridge.php</code> mu-plugin v2.0.0+ installed.</p></div>';
+            return;
+        }
+        ?>
+        <div style="max-width:760px;">
+            <h2>Full Content Sync</h2>
+            <p style="color:#555;">
+                Pulls posts, pages, menus, partials, terms, and whitelisted appearance options
+                (theme_mods, widgets, permalinks, page-builder settings) from the <strong>source</strong>
+                site and applies them to the <strong>target</strong>. URLs are rewritten automatically
+                (source → target). Target's DB is snapshotted to <code>uploads/bridge-backups/</code>
+                before any change. Comments, users, plugin activation, and site identity options are never touched.
+            </p>
+
+            <table class="form-table">
+                <tr>
+                    <th><label for="dbc-fs-source">Source (pull from)</label></th>
+                    <td>
+                        <select id="dbc-fs-source" style="min-width:300px;">
+                            <?php foreach ($sites as $alias => $s) : ?>
+                                <option value="<?php echo esc_attr($alias); ?>"><?php echo esc_html($alias . ' — ' . ($s['url'] ?? '')); ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                    </td>
+                </tr>
+                <tr>
+                    <th><label for="dbc-fs-target">Target (push to)</label></th>
+                    <td>
+                        <select id="dbc-fs-target" style="min-width:300px;">
+                            <?php $i = 0; foreach ($sites as $alias => $s) : ?>
+                                <option value="<?php echo esc_attr($alias); ?>" <?php echo $i++ === 1 ? 'selected' : ''; ?>><?php echo esc_html($alias . ' — ' . ($s['url'] ?? '')); ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                    </td>
+                </tr>
+                <tr>
+                    <th>Post types to sync</th>
+                    <td>
+                        <label style="display:inline-block;margin-right:14px;"><input type="checkbox" class="dbc-fs-pt" value="post" checked> Posts</label>
+                        <label style="display:inline-block;margin-right:14px;"><input type="checkbox" class="dbc-fs-pt" value="page" checked> Pages</label>
+                        <label style="display:inline-block;margin-right:14px;"><input type="checkbox" class="dbc-fs-pt" value="nav_menu_item" checked> Menus</label>
+                        <label style="display:inline-block;margin-right:14px;"><input type="checkbox" class="dbc-fs-pt" value="lc_partial" checked> LC Partials</label>
+                        <label style="display:inline-block;margin-right:14px;"><input type="checkbox" class="dbc-fs-pt" value="wp_block" checked> Reusable Blocks</label>
+                        <label style="display:inline-block;margin-right:14px;"><input type="checkbox" class="dbc-fs-pt" value="custom_css" checked> Custom CSS</label>
+                        <label style="display:inline-block;margin-right:14px;"><input type="checkbox" class="dbc-fs-pt" value="attachment" checked> Attachments (DB rows)</label>
+                        <p class="description" style="margin-top:8px;">Categories, tags, term meta, and whitelisted appearance options (theme_mods, widgets, etc.) are always included.</p>
+                    </td>
+                </tr>
+                <tr>
+                    <th>Uploads files</th>
+                    <td>
+                        <label><input type="checkbox" id="dbc-fs-uploads" checked> Sync media files in <code>wp-content/uploads/</code> (diff by sha1, only changed files transferred)</label>
+                    </td>
+                </tr>
+            </table>
+
+            <p style="margin-top:20px;">
+                <button class="button" id="dbc-fs-dryrun-btn">Dry Run</button>
+                <button class="button button-primary" id="dbc-fs-run-btn" style="margin-left:8px;">Run Full Sync</button>
+                <span id="dbc-fs-result" style="margin-left:14px;"></span>
+            </p>
+
+            <div id="dbc-fs-progress" style="display:none;margin-top:16px;padding:14px 16px;background:#f6f7f7;border:1px solid #dcdcde;border-radius:4px;font-family:Menlo,Monaco,monospace;font-size:12px;line-height:1.6;white-space:pre-wrap;"></div>
+        </div>
         <?php
     }
 
@@ -708,6 +1068,7 @@ class DeployBridgeCommander {
                         <th>What to Push</th>
                         <td>
                             <label style="display:block;margin-bottom:4px;"><input type="checkbox" class="dbc-push-what" value="mu-plugins" checked> mu-plugins/</label>
+                            <label style="display:block;margin-bottom:4px;"><input type="checkbox" class="dbc-push-what" value="plugins"> plugins/ (full plugins folder)</label>
                             <label style="display:block;margin-bottom:4px;"><input type="checkbox" class="dbc-push-what" value="theme"> Child theme</label>
                             <label style="display:block;margin-bottom:4px;"><input type="checkbox" class="dbc-push-what" value="custom"> Custom paths:</label>
                             <input type="text" id="dbc-push-custom" class="regular-text" placeholder="themes/picostrap5/file.php, plugins/my-plugin/" style="margin-top:4px;">
@@ -738,6 +1099,7 @@ class DeployBridgeCommander {
                         <td>
                             <select id="dbc-pull-what">
                                 <option value="mu-plugins">mu-plugins/</option>
+                                <option value="plugins">plugins/ (full plugins folder)</option>
                                 <option value="theme">Child theme</option>
                                 <option value="partials">LC Partials (DB content)</option>
                             </select>
@@ -904,6 +1266,34 @@ class DeployBridgeCommander {
         <?php
     }
 
+    // --- JSON TAB (bulk edit every connection at once) ---
+    private function render_json_tab($sites) {
+        $json = wp_json_encode($sites, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        if ($json === false) $json = "{\n}";
+        ?>
+        <h2>Connections JSON <small style="color:#999;">bulk edit</small></h2>
+        <p style="max-width:820px;color:#555;">
+            This is the raw <code>dbc_sites</code> option — every staging connection Bridge Engine knows about.
+            Edit it directly to add, remove, rename, or bulk-update connections, then <strong>Save JSON</strong>.
+            Each entry is keyed by its alias and needs <code>url</code>, <code>key</code>, <code>secret</code>,
+            <code>local_site</code>, and <code>theme</code>. <code>status</code>/<code>last_check</code> are optional
+            (carried over from the existing connection when omitted).
+        </p>
+        <div style="margin:0 0 14px;padding:10px 14px;background:#fcf9e8;border-left:3px solid #dba617;max-width:820px;">
+            <strong>Heads up:</strong> saving <strong>replaces all connections</strong> with exactly what's below —
+            an alias not present here is removed. This is separate from the CLI's
+            <code>scripts/deploy-sites.json</code>; the two are not auto-synced.
+        </div>
+        <textarea id="dbc-json-editor" class="large-text code" spellcheck="false"
+                  style="width:100%;max-width:820px;min-height:440px;font-family:Menlo,Monaco,monospace;font-size:12px;line-height:1.5;white-space:pre;overflow:auto;"><?php echo esc_textarea($json); ?></textarea>
+        <p style="margin-top:12px;">
+            <button class="button" id="dbc-json-format-btn">Reformat / Validate</button>
+            <button class="button button-primary" id="dbc-json-save-btn" style="margin-left:8px;">Save JSON</button>
+            <span id="dbc-json-result" style="margin-left:12px;"></span>
+        </p>
+        <?php
+    }
+
     // =====================================================================
     // INLINE CSS
     // =====================================================================
@@ -941,6 +1331,36 @@ document.addEventListener('DOMContentLoaded', function() {
         }).fail(function() { btn.prop('disabled', false).text('Test'); alert('Request failed'); });
     });
 
+    // Edit site — load an existing connection into the Add / Edit form.
+    // Use .attr() (not .data()) so long numeric-looking keys/secrets are never
+    // coerced to Numbers and lose precision.
+    $(document).on('click', '.dbc-edit-btn', function() {
+        var b = $(this), alias = b.attr('data-alias');
+        $('#dbc-alias').val(alias).prop('readonly', true);
+        $('#dbc-url').val(b.attr('data-url') || '');
+        $('#dbc-key').val(b.attr('data-key') || '');
+        $('#dbc-secret').val(b.attr('data-secret') || '');
+        $('#dbc-local-site').val(b.attr('data-local') || '');
+        $('#dbc-theme').val(b.attr('data-theme') || '');
+        $('#dbc-save-site-btn').text('Update Site');
+        $('#dbc-edit-mode').html('— editing <strong>' + alias + '</strong> <a href="#" id="dbc-cancel-edit" style="margin-left:6px;">cancel</a>');
+        $('#dbc-save-result').empty();
+        if ($('#dbc-add-site-form').length) {
+            $('html,body').animate({ scrollTop: $('#dbc-add-site-form').offset().top - 60 }, 250);
+        }
+    });
+
+    // Cancel edit — reset the form back to "add" mode
+    $(document).on('click', '#dbc-cancel-edit', function(e) {
+        e.preventDefault();
+        $('#dbc-alias').val('').prop('readonly', false);
+        $('#dbc-url, #dbc-key, #dbc-secret, #dbc-theme').val('');
+        $('#dbc-local-site').val('');
+        $('#dbc-save-site-btn').text('Save Site');
+        $('#dbc-edit-mode').empty();
+        $('#dbc-save-result').empty();
+    });
+
     // Delete site
     $(document).on('click', '.dbc-delete-btn', function() {
         var alias = $(this).data('alias');
@@ -950,10 +1370,46 @@ document.addEventListener('DOMContentLoaded', function() {
         });
     });
 
+    // JSON bulk edit — reformat/validate
+    $('#dbc-json-format-btn').on('click', function() {
+        var ta = $('#dbc-json-editor'), res = $('#dbc-json-result');
+        try {
+            ta.val(JSON.stringify(JSON.parse(ta.val()), null, 2));
+            res.css('color', '#2271b1').text('Valid JSON ✓');
+        } catch (e) {
+            res.css('color', '#d63638').text('Invalid JSON: ' + e.message);
+        }
+    });
+
+    // JSON bulk edit — save (replaces all connections)
+    $('#dbc-json-save-btn').on('click', function() {
+        var btn = $(this), ta = $('#dbc-json-editor'), res = $('#dbc-json-result');
+        var val = ta.val();
+        try { JSON.parse(val); }
+        catch (e) { res.css('color', '#d63638').text('Invalid JSON: ' + e.message); return; }
+        if (!confirm('Replace ALL Bridge Engine connections with this JSON?\n\nAny alias not present below will be removed.')) return;
+        btn.prop('disabled', true);
+        res.css('color', '#666').text('Saving…');
+        $.post(dbc.ajax_url, { action: 'dbc_save_sites_json', nonce: dbc.nonce, json: val }, function(r) {
+            btn.prop('disabled', false);
+            if (r.success) {
+                res.css('color', '#00a32a').text('Saved ' + r.data.count + ' connection' + (r.data.count === 1 ? '' : 's') + '. Reloading…');
+                setTimeout(function() { location.reload(); }, 800);
+            } else {
+                res.css('color', '#d63638').text(r.data || 'Save failed');
+            }
+        }).fail(function(xhr) {
+            btn.prop('disabled', false);
+            res.css('color', '#d63638').text('Request failed (HTTP ' + xhr.status + ')');
+        });
+    });
+
     // Save site
     $('#dbc-save-site-btn').on('click', function() {
         var btn = $(this);
+        var result = $('#dbc-save-result');
         btn.prop('disabled', true);
+        result.html('<span style="color:#666;">Saving...</span>');
         $.post(dbc.ajax_url, {
             action: 'dbc_save_site', nonce: dbc.nonce,
             alias: $('#dbc-alias').val(),
@@ -963,9 +1419,14 @@ document.addEventListener('DOMContentLoaded', function() {
             local_site: $('#dbc-local-site').val(),
             theme: $('#dbc-theme').val(),
         }, function(r) {
-            btn.prop('disabled', false);
-            $('#dbc-save-result').html(r.success ? '<span style="color:green;">Saved!</span>' : '<span style="color:red;">' + r.data + '</span>');
+            result.html(r.success
+                ? '<span style="color:green;">Saved!</span>'
+                : '<span style="color:red;">' + (r.data || 'Error') + '</span>');
             if (r.success) setTimeout(function() { location.reload(); }, 500);
+        }).fail(function(xhr) {
+            result.html('<span style="color:red;">Request failed (HTTP ' + xhr.status + '). Reload the page and try again — nonce may have expired.</span>');
+        }).always(function() {
+            btn.prop('disabled', false);
         });
     });
 
@@ -1067,6 +1528,138 @@ document.addEventListener('DOMContentLoaded', function() {
             btn.prop('disabled', false).text('Save Settings');
             result.css('color', '#d63638').text('❌ Network error.');
         });
+    });
+
+    // ---- Full Sync ----
+    function fsCollectPostTypes() {
+        var pts = [];
+        $('.dbc-fs-pt:checked').each(function() { pts.push($(this).val()); });
+        return pts;
+    }
+
+    function fsValidate() {
+        var src = $('#dbc-fs-source').val(),
+            tgt = $('#dbc-fs-target').val();
+        if (!src || !tgt) return 'Pick source and target';
+        if (src === tgt)  return 'Source and target must differ';
+        if (fsCollectPostTypes().length === 0) return 'Select at least one post type';
+        return null;
+    }
+
+    function fsLog(line) {
+        var box = $('#dbc-fs-progress');
+        box.show();
+        box.append(line + '\n');
+        box.scrollTop(box[0].scrollHeight);
+    }
+
+    function fsRun(dryRun) {
+        var err = fsValidate();
+        if (err) { $('#dbc-fs-result').html('<span style="color:#d63638;">' + err + '</span>'); return; }
+
+        var src    = $('#dbc-fs-source').val(),
+            tgt    = $('#dbc-fs-target').val(),
+            pts    = fsCollectPostTypes(),
+            doUpl  = $('#dbc-fs-uploads').is(':checked'),
+            $btnD  = $('#dbc-fs-dryrun-btn'),
+            $btnR  = $('#dbc-fs-run-btn'),
+            $res   = $('#dbc-fs-result'),
+            $box   = $('#dbc-fs-progress');
+
+        $btnD.prop('disabled', true);
+        $btnR.prop('disabled', true);
+        $box.empty().show();
+        $res.html('<span style="color:#666;">Running...</span>');
+
+        fsLog((dryRun ? '[DRY RUN] ' : '') + 'Pulling content payload from ' + src + ' …');
+
+        $.post(dbc.ajax_url, {
+            action: 'dbc_full_sync',
+            nonce:  dbc.nonce,
+            source: src,
+            target: tgt,
+            post_types: pts,
+            dry_run: dryRun ? 1 : 0,
+        }, function(r) {
+            if (!r.success) {
+                fsLog('ERROR: ' + (r.data || 'unknown'));
+                $res.html('<span style="color:#d63638;">Failed</span>');
+                $btnD.prop('disabled', false);
+                $btnR.prop('disabled', false);
+                return;
+            }
+            var s = r.data.stats || {};
+            fsLog('Posts inserted:    ' + (s.posts_inserted    || 0));
+            fsLog('Postmeta inserted: ' + (s.postmeta_inserted || 0));
+            fsLog('Terms replaced:    ' + (s.terms_replaced    || 0));
+            fsLog('Options updated:   ' + (s.options_updated   || 0));
+            if (s.options_skipped && s.options_skipped.length) {
+                fsLog('Options skipped (' + s.options_skipped.length + '): ' + s.options_skipped.slice(0, 8).join(', ') + (s.options_skipped.length > 8 ? ' …' : ''));
+            }
+            fsLog('URL replace affected rows: ' + (s.replace_affected || 0));
+            if (s.snapshot) fsLog('Snapshot saved: ' + s.snapshot);
+            fsLog('Content stage done in ' + r.data.elapsed_sec + 's.');
+
+            if (dryRun) {
+                fsLog('[DRY RUN COMPLETE — no changes made]');
+                $res.html('<span style="color:#2271b1;">Dry run OK</span>');
+                $btnD.prop('disabled', false);
+                $btnR.prop('disabled', false);
+                return;
+            }
+
+            if (!doUpl) {
+                fsLog('Skipping uploads sync (unchecked).');
+                $res.html('<span style="color:#00a32a;">Sync complete</span>');
+                $btnD.prop('disabled', false);
+                $btnR.prop('disabled', false);
+                return;
+            }
+
+            // Phase 2: uploads diff
+            fsLog('---');
+            fsLog('Diffing uploads …');
+            $.post(dbc.ajax_url, {
+                action: 'dbc_full_sync_uploads',
+                nonce:  dbc.nonce,
+                source: src,
+                target: tgt,
+                batch_size: 50,
+            }, function(u) {
+                if (!u.success) {
+                    var msg = (u.data && u.data.message) || u.data || 'unknown';
+                    fsLog('UPLOADS ERROR: ' + msg);
+                    if (u.data && u.data.transferred) fsLog('Transferred before error: ' + u.data.transferred);
+                    $res.html('<span style="color:#d63638;">Uploads failed</span>');
+                } else {
+                    fsLog('Source files: ' + u.data.source_count + ', Target files: ' + u.data.target_count);
+                    fsLog('Transferred:  ' + u.data.transferred + ' files in ' + u.data.elapsed_sec + 's.');
+                    fsLog('=== SYNC COMPLETE ===');
+                    $res.html('<span style="color:#00a32a;">Sync complete</span>');
+                }
+                $btnD.prop('disabled', false);
+                $btnR.prop('disabled', false);
+            }).fail(function(xhr) {
+                fsLog('UPLOADS REQUEST FAILED: HTTP ' + xhr.status);
+                $res.html('<span style="color:#d63638;">Request failed</span>');
+                $btnD.prop('disabled', false);
+                $btnR.prop('disabled', false);
+            });
+
+        }).fail(function(xhr) {
+            fsLog('REQUEST FAILED: HTTP ' + xhr.status);
+            $res.html('<span style="color:#d63638;">Request failed</span>');
+            $btnD.prop('disabled', false);
+            $btnR.prop('disabled', false);
+        });
+    }
+
+    $('#dbc-fs-dryrun-btn').on('click', function() { fsRun(true); });
+    $('#dbc-fs-run-btn').on('click', function() {
+        var src = $('#dbc-fs-source').val(),
+            tgt = $('#dbc-fs-target').val();
+        if (!confirm('Sync content + appearance from "' + src + '" → "' + tgt + '"?\n\nTarget DB will be snapshotted to uploads/bridge-backups/ first, then synced post types will be wiped and replaced.')) return;
+        fsRun(false);
     });
 });
 JS;
