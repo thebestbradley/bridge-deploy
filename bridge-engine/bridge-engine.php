@@ -2,14 +2,14 @@
 /**
  * Plugin Name: Bridge Engine
  * Description: Local command center for managing staging site connections. Push/pull files, themes, mu-plugins, and DB content to staging sites via the Deploy Bridge API.
- * Version: 2.2.0
+ * Version: 2.3.0
  * Author: HypedUp Studios
  * Text Domain: bridge-engine
  */
 
 defined('ABSPATH') || exit;
 
-define('DBC_VERSION', '2.2.0');
+define('DBC_VERSION', '2.3.0');
 
 /**
  * Default path to the parent directory containing your local WordPress sites.
@@ -80,6 +80,7 @@ class DeployBridgeCommander {
         // Full content sync (bidirectional)
         add_action('wp_ajax_dbc_full_sync',         [$this, 'ajax_full_sync']);
         add_action('wp_ajax_dbc_full_sync_uploads', [$this, 'ajax_full_sync_uploads']);
+        add_action('wp_ajax_dbc_sync_restore',      [$this, 'ajax_sync_restore']);
     }
 
     // =====================================================================
@@ -903,6 +904,26 @@ class DeployBridgeCommander {
     // PAGE RENDERER
     // =====================================================================
 
+    public function ajax_sync_restore() {
+        check_ajax_referer('dbc_nonce', 'nonce');
+        if (!current_user_can('manage_options')) wp_die('Forbidden');
+
+        $alias = sanitize_key($_POST['target'] ?? '');
+        $sites = $this->get_sites();
+        if (empty($sites[$alias])) wp_send_json_error('Site not found: ' . $alias);
+
+        // /sync-restore takes no params (it restores the target's latest rollback);
+        // send an empty JSON body so the HMAC signature validates.
+        $result = $this->api_request($sites[$alias], 'POST', 'sync-restore', '{}');
+
+        if (isset($result['error'])) {
+            $this->add_log('restore', $alias, 'Rollback failed: ' . $result['error'], 0, 'error');
+            wp_send_json_error($result['error']);
+        }
+        $this->add_log('restore', $alias, 'Rolled back to ' . ($result['restored_from'] ?? 'last snapshot'), 0, 'success');
+        wp_send_json_success($result);
+    }
+
     public function render_page() {
         $tab = sanitize_key($_GET['tab'] ?? 'sites');
         $sites = $this->get_sites();
@@ -1068,6 +1089,7 @@ class DeployBridgeCommander {
             <p style="margin-top:20px;">
                 <button class="button" id="dbc-fs-dryrun-btn">Dry Run</button>
                 <button class="button button-primary" id="dbc-fs-run-btn" style="margin-left:8px;">Run Full Sync</button>
+                <button class="button" id="dbc-fs-rollback-btn" style="margin-left:8px;color:#b32d2e;border-color:#b32d2e;" title="Restore the target to the state right before its last sync">↺ Roll Back Target</button>
                 <span id="dbc-fs-result" style="margin-left:14px;"></span>
             </p>
 
@@ -1686,6 +1708,23 @@ document.addEventListener('DOMContentLoaded', function() {
             $btnR.prop('disabled', false);
         });
     }
+
+    $('#dbc-fs-rollback-btn').on('click', function() {
+        var tgt = $('#dbc-fs-target').val();
+        if (!tgt) { $('#dbc-fs-result').html('<span style="color:#d63638;">Pick a target first</span>'); return; }
+        if (!confirm('Roll back "' + tgt + '" to the state right before its last sync?\n\nRestores the pre-sync snapshot on the target.')) return;
+        var btn = $(this); btn.prop('disabled', true);
+        $('#dbc-fs-result').html('<span style="color:#666;">Rolling back…</span>');
+        $.post(dbc.ajax_url, { action: 'dbc_sync_restore', nonce: dbc.nonce, target: tgt }, function(r) {
+            btn.prop('disabled', false);
+            if (r.success) {
+                var s = r.data.stats || {};
+                $('#dbc-fs-result').html('<span style="color:#00a32a;">Rolled back — ' + (s.posts_inserted || 0) + ' posts restored (' + (r.data.restored_from || 'snapshot') + ')</span>');
+            } else {
+                $('#dbc-fs-result').html('<span style="color:#d63638;">Rollback failed: ' + (r.data || 'error') + '</span>');
+            }
+        }).fail(function(xhr) { btn.prop('disabled', false); $('#dbc-fs-result').html('<span style="color:#d63638;">Request failed (HTTP ' + xhr.status + ')</span>'); });
+    });
 
     $('#dbc-fs-dryrun-btn').on('click', function() { fsRun(true); });
     $('#dbc-fs-run-btn').on('click', function() {

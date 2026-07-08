@@ -16,7 +16,7 @@ defined('ABSPATH') || exit;
 // CONSTANTS
 // =========================================================================
 
-define('DEPLOY_BRIDGE_VERSION', '2.0.0');
+define('DEPLOY_BRIDGE_VERSION', '2.1.0');
 define('DEPLOY_BRIDGE_NS', 'deploy-bridge/v1');
 define('DEPLOY_BRIDGE_LOG_TABLE', 'deploy_bridge_log');
 define('DEPLOY_BRIDGE_BACKUP_DIR', WP_CONTENT_DIR . '/deploy-backups');
@@ -270,6 +270,13 @@ add_action('rest_api_init', function () {
     register_rest_route(DEPLOY_BRIDGE_NS, '/sync-import', [
         'methods'             => 'POST',
         'callback'            => 'dbr_endpoint_sync_import',
+        'permission_callback' => 'dbr_authenticate',
+    ]);
+
+    // --- POST /sync-restore — roll back the last sync-import ---
+    register_rest_route(DEPLOY_BRIDGE_NS, '/sync-restore', [
+        'methods'             => 'POST',
+        'callback'            => 'dbr_endpoint_sync_restore',
         'permission_callback' => 'dbr_authenticate',
     ]);
 
@@ -1258,6 +1265,30 @@ function dbr_endpoint_sync_import($request) {
     }
     $stats['snapshot'] = str_replace(ABSPATH, '', $snapshot_file);
 
+    // 1b. Parse-safe rollback point: capture the CURRENT (pre-import) content as
+    // a re-importable JSON payload (reuse the export logic). Restored by
+    // /sync-restore, which feeds it back through this same importer — so any
+    // content (newlines, quotes, shortcodes) round-trips via $wpdb->insert
+    // instead of fragile .sql parsing. Old rollbacks are pruned to the last 10.
+    $rb_req = new WP_REST_Request('POST', '/deploy-bridge/v1/sync-export');
+    $rb_req->set_header('content-type', 'application/json');
+    $rb_req->set_body(wp_json_encode(['post_types' => $post_types]));
+    $rb_resp = dbr_endpoint_sync_export($rb_req);
+    if (!is_wp_error($rb_resp)) {
+        $rb = $rb_resp->get_data();
+        $rb['post_types'] = $post_types;
+        $rb['dry_run']    = false;
+        $rb_file = $snapshot_dir . '/rollback-' . date('Y-m-d_H-i-s') . '.json';
+        @file_put_contents($rb_file, wp_json_encode($rb));
+        $stats['rollback'] = str_replace(ABSPATH, '', $rb_file);
+        // prune: keep the 10 newest rollback files
+        $rb_all = glob($snapshot_dir . '/rollback-*.json');
+        if (is_array($rb_all) && count($rb_all) > 10) {
+            rsort($rb_all);
+            foreach (array_slice($rb_all, 10) as $old) @unlink($old);
+        }
+    }
+
     // 2. Wipe + rebuild posts of the synced types
     $ph = implode(',', array_fill(0, count($post_types), '%s'));
     $existing_ids = $wpdb->get_col($wpdb->prepare(
@@ -1320,6 +1351,40 @@ function dbr_endpoint_sync_import($request) {
         'stats'       => $stats,
         'response_ms' => $ms,
     ]);
+}
+
+// =========================================================================
+// SYNC RESTORE — roll back the last sync-import from its JSON rollback point
+// =========================================================================
+
+function dbr_endpoint_sync_restore($request) {
+    if (!dbr_is_op_allowed('db')) {   // sync ops ride under the 'db' op (allowed by default)
+        return new WP_Error('op_disabled', 'Sync restore is disabled.', ['status' => 403]);
+    }
+    $dir   = WP_CONTENT_DIR . '/uploads/bridge-backups';
+    $files = glob($dir . '/rollback-*.json');
+    if (empty($files)) {
+        return new WP_Error('no_rollback', 'No rollback point found — nothing to restore.', ['status' => 404]);
+    }
+    rsort($files); // newest first (timestamped filenames)
+    $file    = $files[0];
+    $payload = json_decode((string) file_get_contents($file), true);
+    if (!is_array($payload) || empty($payload['post_types'])) {
+        return new WP_Error('bad_rollback', 'Rollback file is unreadable or incomplete.', ['status' => 500]);
+    }
+    // Re-import the captured pre-import content on THIS site (no URL rewrite —
+    // same host). The importer captures a fresh rollback first, so a restore is
+    // itself reversible.
+    unset($payload['replace_url_from'], $payload['replace_url_to']);
+    $payload['dry_run'] = false;
+    $req = new WP_REST_Request('POST', '/deploy-bridge/v1/sync-import');
+    $req->set_header('content-type', 'application/json');
+    $req->set_body(wp_json_encode($payload));
+    $resp = dbr_endpoint_sync_import($req);
+    if (is_wp_error($resp)) return $resp;
+    $data = (array) $resp->get_data();
+    $data['restored_from'] = basename($file);
+    return rest_ensure_response($data);
 }
 
 // =========================================================================
