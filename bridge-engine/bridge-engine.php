@@ -2,14 +2,14 @@
 /**
  * Plugin Name: Bridge Engine
  * Description: Local command center for managing staging site connections. Push/pull files, themes, mu-plugins, and DB content to staging sites via the Deploy Bridge API.
- * Version: 2.1.0
+ * Version: 2.2.0
  * Author: HypedUp Studios
  * Text Domain: bridge-engine
  */
 
 defined('ABSPATH') || exit;
 
-define('DBC_VERSION', '2.1.0');
+define('DBC_VERSION', '2.2.0');
 
 /**
  * Default path to the parent directory containing your local WordPress sites.
@@ -125,6 +125,39 @@ class DeployBridgeCommander {
 
     private function save_sites($sites) {
         update_option('dbc_sites', $sites);
+        $this->write_cli_config($sites);
+    }
+
+    /**
+     * Single source of truth: mirror the GUI connections (dbc_sites) into the
+     * CLI's scripts/deploy-sites.json on every save/edit/delete, so the
+     * deploy.sh tooling never drifts from the Bridge Engine. Writes only the
+     * fields the CLI needs; preserves any non-"sites" top-level keys already in
+     * the file. Best-effort — never blocks the save if the path isn't writable.
+     */
+    private function write_cli_config($sites) {
+        $path = rtrim(self::local_sites_dir(), '/') . '/scripts/deploy-sites.json';
+        if (!is_dir(dirname($path))) return;
+
+        $config = [];
+        if (is_file($path)) {
+            $existing = json_decode((string) file_get_contents($path), true);
+            if (is_array($existing)) $config = $existing;
+        }
+        $config['sites'] = [];
+        foreach ($sites as $alias => $c) {
+            $config['sites'][$alias] = [
+                'url'        => rtrim($c['url'] ?? '', '/'),
+                'key'        => $c['key'] ?? '',
+                'secret'     => $c['secret'] ?? '',
+                'local_site' => $c['local_site'] ?? '',
+                'theme'      => $c['theme'] ?? '',
+            ];
+        }
+        @file_put_contents(
+            $path,
+            wp_json_encode($config, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n"
+        );
     }
 
     private function get_log() {
