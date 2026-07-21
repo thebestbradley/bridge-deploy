@@ -218,6 +218,19 @@ class DeployBridgeCommander {
     // API CLIENT
     // =====================================================================
 
+    /**
+     * Whether TLS certificate verification should be enforced for a target URL.
+     * Real remote hosts (staging/production) have valid certs and MUST be verified
+     * so an attacker can't impersonate the server. Only genuine LOCAL dev hosts
+     * (*.local, localhost) use self-signed certs and are exempted.
+     */
+    private function should_verify_tls($url) {
+        $host = strtolower((string) parse_url($url, PHP_URL_HOST));
+        if ($host === '' || $host === 'localhost' || $host === '127.0.0.1' || $host === '::1') return false;
+        if (substr($host, -6) === '.local' || substr($host, -10) === '.localhost' || substr($host, -5) === '.test') return false;
+        return true; // real domain -> verify the certificate
+    }
+
     private function api_request($site_config, $method, $endpoint, $body = null, $is_file = false, $timeout = 60) {
         $url = rtrim($site_config['url'], '/') . '/wp-json/deploy-bridge/v1/' . $endpoint;
 
@@ -229,7 +242,9 @@ class DeployBridgeCommander {
             'method'  => $method,
             'headers' => $headers,
             'timeout' => $timeout,
-            'sslverify' => false, // local/staging certs
+            // Verify real certs (prevents MITM, esp. during rotation when the new
+            // secret transits); skip only for local .local/.test self-signed dev certs.
+            'sslverify' => $this->should_verify_tls($url),
         ];
 
         if ($body !== null && !$is_file) {
