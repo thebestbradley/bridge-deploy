@@ -2,14 +2,14 @@
 /**
  * Plugin Name: Bridge Engine
  * Description: Local command center for managing staging site connections. Push/pull files, themes, mu-plugins, and DB content to staging sites via the Deploy Bridge API.
- * Version: 2.3.0
+ * Version: 2.4.0
  * Author: HypedUp Studios
  * Text Domain: bridge-engine
  */
 
 defined('ABSPATH') || exit;
 
-define('DBC_VERSION', '2.3.0');
+define('DBC_VERSION', '2.4.0');
 
 /**
  * Default path to the parent directory containing your local WordPress sites.
@@ -74,6 +74,7 @@ class DeployBridgeCommander {
         add_action('wp_ajax_dbc_push', [$this, 'ajax_push']);
         add_action('wp_ajax_dbc_pull', [$this, 'ajax_pull']);
         add_action('wp_ajax_dbc_quick_action', [$this, 'ajax_quick_action']);
+        add_action('wp_ajax_dbc_rotate_site', [$this, 'ajax_rotate_site']);
         add_action('wp_ajax_dbc_clear_log', [$this, 'ajax_clear_log']);
         add_action('wp_ajax_dbc_save_settings', [$this, 'ajax_save_settings']);
 
@@ -340,6 +341,249 @@ class DeployBridgeCommander {
         $this->save_sites($sites);
 
         wp_send_json_success($result);
+    }
+
+    // =====================================================================
+    // CREDENTIAL ROTATION
+    // =====================================================================
+    //
+    // Give each connection a UNIQUE key+secret so a leaked/backup credential
+    // can't authenticate to the other sites (Plesk clones ship with the
+    // template's shared creds). Safe by construction: we NEVER discard the OLD
+    // credentials until a SIGNED request using the NEW secret has been proven
+    // against the receiver, and (on v2.2.0+ receivers) the receiver keeps
+    // accepting the OLD credential for a short grace window. Every failure mode
+    // — dropped response, 429, partial write — therefore leaves the OLD pair
+    // working so we can retry and converge, never a hard lockout.
+
+    /** Probe whether a given {url,key,secret} authenticates a SIGNED op right now. */
+    private function probe_creds($cfg) {
+        $r = $this->api_request($cfg, 'POST', 'db', ['operations' => [['action' => 'get_option', 'key' => 'dbr_enabled']]], false, 20);
+        if (!is_array($r)) return 'unknown';
+        if (isset($r['error'])) {
+            return ((int) ($r['code'] ?? 0) === 401) ? 'denied' : 'unknown'; // 429/5xx/network => unknown
+        }
+        return 'live';
+    }
+
+    /** True if a /db response reports every operation succeeded. */
+    private function db_all_ok($resp) {
+        if (!is_array($resp) || isset($resp['error']) || empty($resp['results'])) return false;
+        foreach ($resp['results'] as $r) {
+            if (($r['status'] ?? '') !== 'success') return false;
+        }
+        return true;
+    }
+
+    /**
+     * Rotate one connection to a fresh unique key+secret. Returns a structured
+     * result array (never throws). $grace = receiver dual-accept window seconds.
+     */
+    public function rotate_site($alias, $grace = 120) {
+        // Per-alias lock — two concurrent rotations for one connection could
+        // diverge the sender store from the receiver. Serialize them.
+        $lock = 'dbc_rot_' . md5($alias);
+        if (get_transient($lock)) {
+            return ['ok' => false, 'state' => 'busy', 'message' => "A rotation for {$alias} is already in progress; try again shortly."];
+        }
+        set_transient($lock, 1, 180);
+        try {
+            return $this->rotate_site_locked($alias, $grace);
+        } finally {
+            delete_transient($lock);
+        }
+    }
+
+    private function rotate_site_locked($alias, $grace) {
+        $sites = $this->get_sites();
+        if (empty($sites[$alias])) return ['ok' => false, 'state' => 'error', 'message' => "Unknown connection: {$alias}"];
+
+        $site = $sites[$alias];
+        $url = $site['url'] ?? '';
+        $old_key = $site['key'] ?? '';
+        $old_secret = $site['secret'] ?? '';
+        if ($url === '' || $old_key === '' || $old_secret === '') {
+            return ['ok' => false, 'state' => 'error', 'message' => 'Connection missing url/key/secret'];
+        }
+        $old_cfg = ['url' => $url, 'key' => $old_key, 'secret' => $old_secret];
+
+        // RECOVERY FIRST: a prior attempt may have left a pending pair the receiver
+        // actually committed (dropped ACK / transient verify). Fall FORWARD onto it
+        // before generating anything, and NEVER clobber a pending pair we can't rule
+        // out — this is what makes rotation impossible to permanently strand.
+        if (!empty($site['pending_key']) && !empty($site['pending_secret'])) {
+            $pending_cfg = ['url' => $url, 'key' => $site['pending_key'], 'secret' => $site['pending_secret']];
+            $p = $this->probe_creds($pending_cfg);
+            if ($p === 'unknown') { sleep(3); $p = $this->probe_creds($pending_cfg); }
+            if ($p === 'live') {
+                // Receiver is already on the pending pair → promote and finish.
+                return $this->finish_rotation($alias, $old_key, $old_secret, $site['pending_key'], $site['pending_secret'], $pending_cfg, true, 'Recovered a previously-committed rotation');
+            }
+            if ($p === 'unknown') {
+                // Can't confirm whether the receiver holds this pending pair — refuse
+                // to overwrite it. Idempotent retry will self-heal once reachable.
+                return ['ok' => false, 'state' => 'recovery_pending', 'message' => "Receiver unreachable while a pending rotation for {$alias} is unresolved; pending credentials kept. Retry when reachable."];
+            }
+            // 'denied' → receiver never adopted this pending pair; it is stale.
+            unset($sites[$alias]['pending_key'], $sites[$alias]['pending_secret'], $sites[$alias]['pending_fp']);
+            $this->save_sites($sites);
+        }
+
+        // Capability detect — atomic op requires receiver >= 2.2.0. A transient
+        // /status failure must NOT downgrade a capable receiver; retry then abort
+        // (nothing mutated and no pending written yet, so aborting is fully clean).
+        $status = $this->api_request($old_cfg, 'GET', 'status');
+        if (!is_array($status) || isset($status['error'])) { sleep(2); $status = $this->api_request($old_cfg, 'GET', 'status'); }
+        if (!is_array($status) || isset($status['error'])) {
+            return ['ok' => false, 'state' => 'precheck_failed', 'message' => 'Could not reach the receiver /status; rotation aborted before any change. Old credentials untouched — retry when reachable.'];
+        }
+        $version = (string) ($status['plugin_version'] ?? '');
+        $atomic = $version !== '' && version_compare($version, '2.2.0', '>=');
+
+        // Generate the new pair (alphanumeric — matches the receiver's own
+        // wp_generate_password(,false) charset and survives sanitize_text_field).
+        $new_key = wp_generate_password(32, false);
+        $new_secret = wp_generate_password(64, false);
+        $new_key_fp = substr(hash('sha256', $new_key), 0, 12);
+        $new_secret_fp = substr(hash('sha256', $new_secret), 0, 12);
+        $new_cfg = ['url' => $url, 'key' => $new_key, 'secret' => $new_secret];
+
+        // Durably record the pending pair BEFORE the mutating switch — now genuinely
+        // recoverable via the RECOVERY block at the top of a subsequent call.
+        $sites = $this->get_sites();
+        $sites[$alias]['pending_key'] = $new_key;
+        $sites[$alias]['pending_secret'] = $new_secret;
+        $sites[$alias]['pending_fp'] = $new_key_fp . '/' . $new_secret_fp;
+        $sites[$alias]['rotation_state'] = 'rotating';
+        $sites[$alias]['rotation_started'] = current_time('mysql');
+        $this->save_sites($sites);
+
+        // Switch (signed with the OLD secret — auth runs before ops execute).
+        $switch_confirmed = false;
+        if ($atomic) {
+            $switch = $this->api_request($old_cfg, 'POST', 'db', ['operations' => [[
+                'action' => 'rotate_credentials', 'new_key' => $new_key, 'new_secret' => $new_secret, 'grace_seconds' => $grace,
+            ]]]);
+            if ($this->db_all_ok($switch)) {
+                $res = $switch['results'][0]['result'] ?? [];
+                $switch_confirmed = !empty($res['rotated']) && ($res['key_fp'] ?? '') === $new_key_fp && ($res['secret_fp'] ?? '') === $new_secret_fp;
+            }
+        } else {
+            $switch = $this->api_request($old_cfg, 'POST', 'db', ['operations' => [
+                ['action' => 'update_option', 'key' => 'dbr_api_key', 'value' => $new_key],
+                ['action' => 'update_option', 'key' => 'dbr_api_secret', 'value' => $new_secret],
+            ]]);
+        }
+
+        // Verify with the NEW creds — the only source of truth is a SIGNED op that
+        // authenticates under the new secret (never HTTP 200 or GET /status).
+        $probe_new = $this->probe_creds($new_cfg);
+        if ($probe_new === 'unknown') { sleep(3); $probe_new = $this->probe_creds($new_cfg); }
+        if ($probe_new === 'live' || ($switch_confirmed && $probe_new !== 'denied')) {
+            return $this->finish_rotation($alias, $old_key, $old_secret, $new_key, $new_secret, $new_cfg, $atomic, 'Rotated + verified');
+        }
+
+        // NEW not confirmed. On the atomic path the OLD pair authenticates during
+        // the grace window EVEN IF the switch took — so "OLD is live" is NOT proof
+        // of failure. Ask the receiver (signed with OLD, valid in grace) for its
+        // CURRENT fingerprint and compare: == NEW ⇒ switch took ⇒ promote;
+        // == OLD ⇒ switch didn't take ⇒ abandon pending, keep OLD.
+        if ($atomic) {
+            $fpresp = $this->api_request($old_cfg, 'POST', 'db', ['operations' => [['action' => 'credentials_fingerprint']]]);
+            if ($this->db_all_ok($fpresp)) {
+                $fp = $fpresp['results'][0]['result'] ?? [];
+                if (($fp['key_fp'] ?? '') === $new_key_fp && ($fp['secret_fp'] ?? '') === $new_secret_fp) {
+                    return $this->finish_rotation($alias, $old_key, $old_secret, $new_key, $new_secret, $new_cfg, true, 'Rotated + verified (via receiver fingerprint)');
+                }
+                if (($fp['key_fp'] ?? '') === substr(hash('sha256', $old_key), 0, 12)
+                    && ($fp['secret_fp'] ?? '') === substr(hash('sha256', $old_secret), 0, 12)) {
+                    return $this->abandon_pending($alias, 'Switch did not take; OLD credentials still active. No change — safe to retry.');
+                }
+            }
+            // Inconclusive → keep pending for the top-of-call recovery next time.
+            return $this->strand($alias);
+        }
+
+        // Fallback (pre-2.2.0) path: OLD has no grace window, so OLD-live truly
+        // means the switch didn't take; otherwise detect a mixed pair and finish it.
+        $probe_old = $this->probe_creds($old_cfg);
+        if ($probe_old === 'unknown') { sleep(3); $probe_old = $this->probe_creds($old_cfg); }
+        if ($probe_old === 'live') {
+            return $this->abandon_pending($alias, 'Switch did not take; OLD credentials still active. No change — safe to retry.');
+        }
+        $mixed = null;
+        if ($this->probe_creds(['url' => $url, 'key' => $new_key, 'secret' => $old_secret]) === 'live') {
+            $mixed = ['url' => $url, 'key' => $new_key, 'secret' => $old_secret];
+            $this->api_request($mixed, 'POST', 'db', ['operations' => [['action' => 'update_option', 'key' => 'dbr_api_secret', 'value' => $new_secret]]]);
+        } elseif ($this->probe_creds(['url' => $url, 'key' => $old_key, 'secret' => $new_secret]) === 'live') {
+            $mixed = ['url' => $url, 'key' => $old_key, 'secret' => $new_secret];
+            $this->api_request($mixed, 'POST', 'db', ['operations' => [['action' => 'update_option', 'key' => 'dbr_api_key', 'value' => $new_key]]]);
+        }
+        if ($mixed !== null && $this->probe_creds($new_cfg) === 'live') {
+            return $this->finish_rotation($alias, $old_key, $old_secret, $new_key, $new_secret, $new_cfg, false, 'Rotated + verified (recovered from partial apply)');
+        }
+        return $this->strand($alias);
+    }
+
+    /** Discard the pending pair, keep OLD active, mark failed_safe (retryable). */
+    private function abandon_pending($alias, $message) {
+        $sites = $this->get_sites();
+        unset($sites[$alias]['pending_key'], $sites[$alias]['pending_secret'], $sites[$alias]['pending_fp']);
+        $sites[$alias]['rotation_state'] = 'failed_safe';
+        $this->save_sites($sites);
+        $this->add_log('config', $alias, 'Rotation did not take — OLD credentials still active (safe, retryable)', 0, 'error');
+        return ['ok' => false, 'state' => 'failed_safe', 'message' => $message];
+    }
+
+    /** Indeterminate this pass: KEEP the pending pair so the top-of-call recovery
+     *  block promotes it automatically on the next attempt. Never a hard lockout. */
+    private function strand($alias) {
+        $sites = $this->get_sites();
+        $sites[$alias]['rotation_state'] = 'stranded';
+        $this->save_sites($sites);
+        $this->add_log('config', $alias, 'Rotation inconclusive — pending creds preserved; a retry will auto-recover', 0, 'error');
+        return [
+            'ok' => false, 'state' => 'stranded',
+            'message' => 'Could not confirm the rotation this pass. The pending credentials are preserved — just retry and it will fall forward onto them automatically. If it persists, break-glass on the receiver: `wp option update dbr_api_key <value>` / `dbr_api_secret <value>` to a known pair, then retry.',
+        ];
+    }
+
+    /** Promote the new creds into the store, end the grace window, log. */
+    private function finish_rotation($alias, $old_key, $old_secret, $new_key, $new_secret, $new_cfg, $atomic, $message) {
+        $sites = $this->get_sites();
+        $sites[$alias]['prev_key'] = $old_key;       // one-shot recovery record
+        $sites[$alias]['prev_secret'] = $old_secret;
+        $sites[$alias]['key'] = $new_key;
+        $sites[$alias]['secret'] = $new_secret;
+        unset($sites[$alias]['pending_key'], $sites[$alias]['pending_secret'], $sites[$alias]['pending_fp']);
+        $sites[$alias]['rotation_state'] = 'rotated';
+        $sites[$alias]['rotation_completed'] = current_time('mysql');
+        $sites[$alias]['status'] = 'connected';
+        $sites[$alias]['last_check'] = current_time('mysql');
+        $this->save_sites($sites);
+
+        // End the receiver grace window early now that NEW is proven (atomic path).
+        if ($atomic) {
+            $this->api_request($new_cfg, 'POST', 'db', ['operations' => [['action' => 'drop_previous_credentials']]]);
+        }
+
+        $fp = substr(hash('sha256', $new_key), 0, 12) . '/' . substr(hash('sha256', $new_secret), 0, 12);
+        $this->add_log('config', $alias, "Credentials rotated (fp {$fp})");
+        return ['ok' => true, 'state' => 'rotated', 'atomic' => $atomic, 'fp' => $fp, 'message' => $message];
+    }
+
+    public function ajax_rotate_site() {
+        check_ajax_referer('dbc_nonce', 'nonce');
+        if (!current_user_can('manage_options')) wp_die('Forbidden');
+
+        $alias = sanitize_key($_POST['alias'] ?? '');
+        if ($alias === '') wp_send_json_error('Alias is required');
+
+        $result = $this->rotate_site($alias);
+        if (!empty($result['ok'])) {
+            wp_send_json_success($result);
+        }
+        wp_send_json_error($result['message'] ?? 'Rotation failed');
     }
 
     public function ajax_save_site() {
@@ -988,6 +1232,7 @@ class DeployBridgeCommander {
                     <td><?php echo esc_html($s['last_check'] ?? 'Never'); ?></td>
                     <td>
                         <button class="button button-small dbc-test-btn" data-alias="<?php echo esc_attr($alias); ?>">Test</button>
+                        <button class="button button-small dbc-rotate-btn" data-alias="<?php echo esc_attr($alias); ?>" title="Generate a fresh unique key+secret for this site and push it to the receiver (safe: old creds kept until the new pair is verified)">Rotate&nbsp;Keys</button>
                         <button class="button button-small dbc-edit-btn"
                                 data-alias="<?php echo esc_attr($alias); ?>"
                                 data-url="<?php echo esc_attr($s['url'] ?? ''); ?>"
@@ -1384,6 +1629,22 @@ document.addEventListener('DOMContentLoaded', function() {
                 alert('Connection failed: ' + (r.data || 'Unknown error'));
             }
         }).fail(function() { btn.prop('disabled', false).text('Test'); alert('Request failed'); });
+    });
+
+    // Rotate keys — generate a fresh unique key+secret and push it to the receiver.
+    $(document).on('click', '.dbc-rotate-btn', function() {
+        var btn = $(this), alias = btn.data('alias');
+        if (!confirm('Rotate credentials for "' + alias + '"?\n\nA fresh unique key+secret will be generated and pushed to the receiver. The OLD credentials are kept until the new pair is verified, so this is safe to retry.')) return;
+        btn.prop('disabled', true).text('Rotating...');
+        $.post(dbc.ajax_url, { action: 'dbc_rotate_site', nonce: dbc.nonce, alias: alias }, function(r) {
+            btn.prop('disabled', false).html('Rotate&nbsp;Keys');
+            if (r.success) {
+                alert('✓ Rotated ' + alias + '\n\n' + (r.data.message || '') + '\nFingerprint: ' + (r.data.fp || '') + (r.data.atomic ? '\n(atomic, grace-window receiver)' : '\n(fallback path)'));
+                location.reload();
+            } else {
+                alert('Rotation not completed for ' + alias + ':\n\n' + (r.data || 'Unknown error') + '\n\n(No credentials were lost — see the log.)');
+            }
+        }).fail(function(xhr) { btn.prop('disabled', false).html('Rotate&nbsp;Keys'); alert('Request failed (HTTP ' + xhr.status + '). The old credentials are unchanged.'); });
     });
 
     // Edit site — load an existing connection into the Add / Edit form.
