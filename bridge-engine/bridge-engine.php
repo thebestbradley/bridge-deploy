@@ -231,8 +231,22 @@ class DeployBridgeCommander {
         return true; // real domain -> verify the certificate
     }
 
+    /**
+     * Build a receiver REST URL. The pretty-permalink form (/wp-json/...) only
+     * resolves when the target site has pretty permalinks + flushed rewrite
+     * rules; a fresh clone without them answers only the ?rest_route= fallback
+     * form (which the receiver's own rest_url()-based test uses, so its test
+     * passes while a hardcoded /wp-json/ request 404s).
+     */
+    private function rest_url_for($base, $endpoint, $rest_route = false) {
+        $base = rtrim($base, '/');
+        return $rest_route
+            ? $base . '/?rest_route=/deploy-bridge/v1/' . $endpoint
+            : $base . '/wp-json/deploy-bridge/v1/' . $endpoint;
+    }
+
     private function api_request($site_config, $method, $endpoint, $body = null, $is_file = false, $timeout = 60) {
-        $url = rtrim($site_config['url'], '/') . '/wp-json/deploy-bridge/v1/' . $endpoint;
+        $url = $this->rest_url_for($site_config['url'], $endpoint, false);
 
         $headers = [
             'X-Deploy-Key' => $site_config['key'],
@@ -274,6 +288,15 @@ class DeployBridgeCommander {
         }
 
         $response = wp_remote_request($url, $args);
+
+        // Permalink resilience: if the pretty REST path 404s (clone without
+        // flushed rewrite rules), retry once via the ?rest_route= form, which
+        // resolves regardless of the target's permalink structure. Same host,
+        // same body/signature, so $args is reused unchanged.
+        if (!is_wp_error($response) && 404 === (int) wp_remote_retrieve_response_code($response)) {
+            $alt_url  = $this->rest_url_for($site_config['url'], $endpoint, true);
+            $response = wp_remote_request($alt_url, $args);
+        }
 
         if (is_wp_error($response)) {
             return ['error' => $response->get_error_message()];
