@@ -3,7 +3,7 @@
  * Plugin Name: Deploy Bridge
  * Description: REST API receiver for remote file pushes, DB operations, and site management.
  *              Install on staging/production sites. Authenticated via API key + HMAC signature.
- * Version: 2.2.0
+ * Version: 2.3.0
  * Author: HypedUp Studios
  *
  * Admin dashboard: Tools > Deploy Bridge
@@ -16,7 +16,7 @@ defined('ABSPATH') || exit;
 // CONSTANTS
 // =========================================================================
 
-define('DEPLOY_BRIDGE_VERSION', '2.2.0');
+define('DEPLOY_BRIDGE_VERSION', '2.3.0');
 define('DEPLOY_BRIDGE_NS', 'deploy-bridge/v1');
 define('DEPLOY_BRIDGE_LOG_TABLE', 'deploy_bridge_log');
 define('DEPLOY_BRIDGE_BACKUP_DIR', WP_CONTENT_DIR . '/deploy-backups');
@@ -900,7 +900,7 @@ function dbr_endpoint_eval($request) {
 
     $allowed_actions = [
         'activate_theme', 'activate_plugin', 'deactivate_plugin',
-        'flush_cache', 'flush_rewrite_rules', 'search_replace',
+        'flush_cache', 'flush_rewrite_rules', 'search_replace', 'search_replace_all',
         'import_partials', 'clear_lc_cache', 'list_themes', 'list_plugins',
         'get_partials', 'publish_drafts',
     ];
@@ -968,6 +968,31 @@ function dbr_execute_eval($action, $params) {
                 $search, $replace, '%' . $wpdb->esc_like($search) . '%'
             ));
             return ['affected_rows' => $affected, 'search' => $search, 'replace' => $replace];
+
+        case 'search_replace_all':
+            // Multi-table literal search/replace — needed for un-tokenized templates (reverse)
+            // WARNING: raw SQL REPLACE is NOT serialization-safe. A replacement that changes the
+            // string length corrupts PHP-serialized postmeta/option values (Forminator forms,
+            // brand_engine_data, widgets). Only use it for equal-length or unserialized targets.
+            // where identity is hardcoded across post_content, titles, postmeta, options, and Yoast.
+            $search = $params['search'] ?? '';
+            $replace = $params['replace'] ?? '';
+            if (empty($search)) throw new Exception('Missing search parameter');
+            global $wpdb;
+            $like = '%' . $wpdb->esc_like($search) . '%';
+            $total = 0;
+            $total += (int) $wpdb->query($wpdb->prepare("UPDATE {$wpdb->posts} SET post_content = REPLACE(post_content, %s, %s) WHERE post_content LIKE %s", $search, $replace, $like));
+            $total += (int) $wpdb->query($wpdb->prepare("UPDATE {$wpdb->posts} SET post_title = REPLACE(post_title, %s, %s) WHERE post_title LIKE %s", $search, $replace, $like));
+            $total += (int) $wpdb->query($wpdb->prepare("UPDATE {$wpdb->posts} SET post_excerpt = REPLACE(post_excerpt, %s, %s) WHERE post_excerpt LIKE %s", $search, $replace, $like));
+            $total += (int) $wpdb->query($wpdb->prepare("UPDATE {$wpdb->postmeta} SET meta_value = REPLACE(meta_value, %s, %s) WHERE meta_value LIKE %s", $search, $replace, $like));
+            $total += (int) $wpdb->query($wpdb->prepare("UPDATE {$wpdb->options} SET option_value = REPLACE(option_value, %s, %s) WHERE option_value LIKE %s", $search, $replace, $like));
+            $yoast_tbl = $wpdb->prefix . 'yoast_indexable';
+            if ($wpdb->get_var($wpdb->prepare("SHOW TABLES LIKE %s", $yoast_tbl)) === $yoast_tbl) {
+                foreach (['title','description','breadcrumb_title','og_title','og_description','twitter_title','twitter_description'] as $col) {
+                    $total += (int) $wpdb->query($wpdb->prepare("UPDATE `{$yoast_tbl}` SET `{$col}` = REPLACE(`{$col}`, %s, %s) WHERE `{$col}` LIKE %s", $search, $replace, $like));
+                }
+            }
+            return ['affected_rows' => $total, 'search' => $search, 'replace' => $replace, 'multi_table' => true];
 
         case 'clear_lc_cache':
             // Clear LiveCanvas transients and caches
