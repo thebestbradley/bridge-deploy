@@ -3,7 +3,7 @@
  * Plugin Name: Deploy Bridge
  * Description: REST API receiver for remote file pushes, DB operations, and site management.
  *              Install on staging/production sites. Authenticated via API key + HMAC signature.
- * Version: 2.3.0
+ * Version: 2.4.0
  * Author: HypedUp Studios
  *
  * Admin dashboard: Tools > Deploy Bridge
@@ -16,7 +16,7 @@ defined('ABSPATH') || exit;
 // CONSTANTS
 // =========================================================================
 
-define('DEPLOY_BRIDGE_VERSION', '2.3.0');
+define('DEPLOY_BRIDGE_VERSION', '2.4.0');
 define('DEPLOY_BRIDGE_NS', 'deploy-bridge/v1');
 define('DEPLOY_BRIDGE_LOG_TABLE', 'deploy_bridge_log');
 define('DEPLOY_BRIDGE_BACKUP_DIR', WP_CONTENT_DIR . '/deploy-backups');
@@ -899,7 +899,7 @@ function dbr_endpoint_eval($request) {
     $params = $body['params'] ?? [];
 
     $allowed_actions = [
-        'activate_theme', 'activate_plugin', 'deactivate_plugin',
+        'activate_theme', 'activate_plugin', 'deactivate_plugin', 'delete_plugin',
         'flush_cache', 'flush_rewrite_rules', 'search_replace', 'search_replace_all',
         'import_partials', 'clear_lc_cache', 'list_themes', 'list_plugins',
         'get_partials', 'publish_drafts',
@@ -928,6 +928,33 @@ function dbr_endpoint_eval($request) {
     }
 }
 
+/**
+ * Delete an INACTIVE plugin (files + its uninstall routine), the way Plugins > Delete does.
+ * Refuses active plugins and anything that would need FTP credentials (the credentials form
+ * would print HTML into the REST response), so it can never take a running feature away.
+ */
+function dbr_delete_plugin($plugin) {
+    if (!$plugin || strpos($plugin, '..') !== false || substr($plugin, -4) !== '.php') {
+        throw new Exception('Missing or invalid plugin parameter (expected folder/file.php)');
+    }
+    require_once ABSPATH . 'wp-admin/includes/plugin.php';
+    require_once ABSPATH . 'wp-admin/includes/file.php';
+    if (!array_key_exists($plugin, get_plugins())) {
+        return ['deleted' => false, 'plugin' => $plugin, 'reason' => 'not installed'];
+    }
+    if (is_plugin_active($plugin) || is_plugin_active_for_network($plugin)) {
+        throw new Exception("Refusing to delete an active plugin: $plugin (deactivate it first)");
+    }
+    if (get_filesystem_method() !== 'direct') {
+        throw new Exception('Filesystem is not writable directly; delete it from wp-admin instead');
+    }
+    $result = delete_plugins([$plugin]);
+    if (is_wp_error($result)) throw new Exception($result->get_error_message());
+    if ($result !== true) throw new Exception('delete_plugins() did not complete');
+    wp_clean_plugins_cache(false);
+    return ['deleted' => true, 'plugin' => $plugin];
+}
+
 function dbr_execute_eval($action, $params) {
     switch ($action) {
         case 'activate_theme':
@@ -948,6 +975,9 @@ function dbr_execute_eval($action, $params) {
             if (!$plugin) throw new Exception('Missing plugin parameter');
             deactivate_plugins($plugin);
             return ['deactivated' => $plugin];
+
+        case 'delete_plugin':
+            return dbr_delete_plugin(sanitize_text_field($params['plugin'] ?? ''));
 
         case 'flush_cache':
             wp_cache_flush();
